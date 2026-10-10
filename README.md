@@ -233,6 +233,29 @@ DesktopAI/
 
 All configuration is managed through environment variables (`.env` file) and `src/config.py`.
 
+### Command Execution Safety
+
+The `run_command` tool includes safeguards to reduce the risk of unsafe or long-running commands.
+
+- **Confirmation:** Commands matching configured dangerous-command patterns require user approval when confirmation is enabled. If approval is denied or cannot be obtained, the command is cancelled.
+- **Timeout:** Commands that exceed the configured execution time are terminated.
+- **Output limit:** Returned command output is truncated when it exceeds the configured character limit.
+
+Configure these options in your `.env` file:
+
+```dotenv
+COMMAND_TIMEOUT=30
+COMMAND_MAX_OUTPUT_CHARS=10000
+COMMAND_REQUIRE_CONFIRMATION=true
+```
+
+- `COMMAND_TIMEOUT`: Maximum command execution time, in seconds.
+- `COMMAND_MAX_OUTPUT_CHARS`: Maximum number of output characters returned.
+- `COMMAND_REQUIRE_CONFIRMATION`: Set to `true` to require confirmation for commands detected as dangerous. Set to `false` to disable this confirmation safeguard.
+
+**Security note:** Pattern-based detection is only a safeguard, not a complete security sandbox. It may not identify every dangerous command or shell syntax. Review commands carefully before approving them.
+
+
 ### Personalization
 ```bash
 # In your .env file

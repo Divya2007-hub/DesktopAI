@@ -5,8 +5,9 @@ Install with: pip install PyQt5
 
 import sys
 from queue import Queue
+from threading import Event
 
-from PyQt5.QtCore import QSize, Qt, QTimer
+from PyQt5.QtCore import QSize, QThread, Qt, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QApplication,
@@ -15,6 +16,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QScrollArea,
     QToolButton,
@@ -32,14 +34,20 @@ logger = get_logger()
 class TransparentOverlayQt(QMainWindow):
     """A transparent overlay that displays transcriptions and responses using PyQt."""
 
+    command_confirmation_requested = pyqtSignal(str, object)
+
     def __init__(self, message_timeout=5, exit_callback=None):
         """Initialize the overlay.
 
         Args:
-            message_timeout (int): Number of seconds after which messages fade out
-            exit_callback (callable): Function to call when the overlay is closed
+            message_timeout (int): Number of seconds after which messages fade out.
+            exit_callback (callable): Function to call when the overlay is closed.
         """
         super().__init__()
+
+        self.command_confirmation_requested.connect(
+            self._show_command_confirmation
+        )
 
         self.message_timeout = message_timeout
         self.exit_callback = exit_callback
@@ -88,11 +96,16 @@ class TransparentOverlayQt(QMainWindow):
         top_layout.addWidget(self.status_indicator)
         top_layout.addWidget(self.status_text)
         top_layout.addStretch()
-        # Minimize button as icon at right of status bar
+
+        # Minimize button
         self.minimize_btn = QToolButton()
-        self.minimize_btn.setIcon(self.style().standardIcon(self.style().SP_TitleBarMinButton))
+        self.minimize_btn.setIcon(
+            self.style().standardIcon(self.style().SP_TitleBarMinButton)
+        )
         self.minimize_btn.setIconSize(QSize(16, 16))
-        self.minimize_btn.setStyleSheet("background: transparent; border: none; margin: 2px;")
+        self.minimize_btn.setStyleSheet(
+            "background: transparent; border: none; margin: 2px;"
+        )
         self.minimize_btn.clicked.connect(self.hide)
         top_layout.addWidget(self.minimize_btn)
         main_layout.addLayout(top_layout)
@@ -108,16 +121,16 @@ class TransparentOverlayQt(QMainWindow):
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setStyleSheet("background: transparent;")
+
         self.log_container = QWidget()
         self.log_layout = QVBoxLayout(self.log_container)
-        self.log_layout.addStretch()  # Keeps messages pinned to the top
+        self.log_layout.addStretch()
         self.scroll_area.setWidget(self.log_container)
         main_layout.addWidget(self.scroll_area)
 
         # Control bar
         control_layout = QHBoxLayout()
 
-        # Input box and send button
         self.input_box = QLineEdit()
         self.input_box.setPlaceholderText("Type your message...")
         self.input_box.setStyleSheet("""
@@ -126,6 +139,7 @@ class TransparentOverlayQt(QMainWindow):
             padding: 5px;
             border-radius: 5px;
         """)
+
         self.send_btn = QPushButton("Send")
         self.send_btn.setStyleSheet("""
             background-color: #333333;
@@ -134,6 +148,7 @@ class TransparentOverlayQt(QMainWindow):
             padding: 5px;
             border-radius: 5px;
         """)
+
         self.send_btn.clicked.connect(self.send_message)
         self.input_box.returnPressed.connect(self.send_message)
 
@@ -141,7 +156,6 @@ class TransparentOverlayQt(QMainWindow):
         control_layout.addWidget(self.send_btn)
         main_layout.addLayout(control_layout)
 
-        # Set the central widget
         self.setCentralWidget(central_widget)
 
         # Enable dragging
@@ -150,7 +164,9 @@ class TransparentOverlayQt(QMainWindow):
     def mouse_press_event(self, event):
         """Handle mouse press event for dragging."""
         if event.button() == Qt.LeftButton:
-            self.drag_position = event.globalPos() - self.frameGeometry().topLeft()
+            self.drag_position = (
+                event.globalPos() - self.frameGeometry().topLeft()
+            )
             event.accept()
 
     def mouse_move_event(self, event):
@@ -167,15 +183,11 @@ class TransparentOverlayQt(QMainWindow):
         event.accept()
 
     def update_status(self, status, color="gray"):
-        """Update the status indicator.
-
-        Args:
-            status (str): Status message
-            color (str): Color of the status indicator
-        """
+        """Update the status indicator."""
         self.message_queue.put(("status", status, color))
 
     def add_log_message(self, text, color="white"):
+        """Add a message to the overlay log."""
         label = QLabel(text)
         label.setFont(QFont("Arial", 10))
         label.setStyleSheet(f"color: {color};")
@@ -185,13 +197,15 @@ class TransparentOverlayQt(QMainWindow):
         # Auto-scroll to bottom
         QTimer.singleShot(
             50,
-            lambda: self.scroll_area.verticalScrollBar().setValue(self.scroll_area.verticalScrollBar().maximum()),
+            lambda: self.scroll_area.verticalScrollBar().setValue(
+                self.scroll_area.verticalScrollBar().maximum()
+            ),
         )
 
     def put_message(self, msg_type, *args):
         """Put a message into the queue."""
         self.message_queue.put((msg_type, *args))
-        QTimer.singleShot(0, self.process_messages)  # Schedule async-safe execution
+        QTimer.singleShot(0, self.process_messages)
 
     def process_messages(self):
         """Process messages from the queue."""
@@ -206,14 +220,64 @@ class TransparentOverlayQt(QMainWindow):
 
                 elif msg_type == "query":
                     text = args[0]
-                    self.add_log_message(f"You: {text}", "#00FFFF")  # Cyan
+                    self.add_log_message(f"You: {text}", "#00FFFF")
 
                 elif msg_type == "response":
                     text = args[0]
-                    self.add_log_message(f"Jasper: {text}", "#00FF00")  # Green
+                    self.add_log_message(f"Jasper: {text}", "#00FF00")
 
-            except Exception as e:
-                logger.error(f"Error processing message: {e}")
+            except Exception as exc:
+                logger.error("Error processing message: %s", exc)
+
+    def _show_command_confirmation(self, command, result):
+        """Display a confirmation dialog on the Qt UI thread."""
+        try:
+            answer = QMessageBox.warning(
+                self,
+                "Confirm Command Execution",
+                (
+                    "The assistant wants to execute this command:\n\n"
+                    f"{command}\n\n"
+                    "Allow this command?"
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            result["approved"] = answer == QMessageBox.Yes
+        except Exception:
+            logger.exception("Failed to display command confirmation.")
+            result["approved"] = False
+        finally:
+            result["event"].set()
+
+    def confirm_command(self, command, timeout=120):
+        """Require explicit user approval; deny if confirmation times out."""
+        if QThread.currentThread() == self.thread():
+            answer = QMessageBox.warning(
+                self,
+                "Confirm Command Execution",
+                (
+                    "The assistant wants to execute this command:\n\n"
+                    f"{command}\n\n"
+                    "Allow this command?"
+                ),
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            return answer == QMessageBox.Yes
+
+        event = Event()
+        result = {"event": event, "approved": False}
+
+        self.command_confirmation_requested.emit(command, result)
+
+        if not event.wait(timeout):
+            logger.warning(
+                "Command confirmation timed out; denying command."
+            )
+            return False
+
+        return result["approved"]
 
     def start(self):
         """Start the overlay."""
@@ -225,8 +289,10 @@ class TransparentOverlayQt(QMainWindow):
         self.close()
 
     def send_message(self):
+        """Send a user message to the assistant."""
         message = self.input_box.text().strip()
         self.input_box.clear()
+
         if message and self.on_new_message:
             executor.submit(self.on_new_message, message)
 
@@ -235,20 +301,35 @@ app = QApplication(sys.argv)
 overlay = TransparentOverlayQt(message_timeout=5)
 
 
-# Alternative main function that can be used to test this GUI
 def main():
+    """Run a demo of the overlay."""
+    overlay.show()
     overlay.start()
 
-    # Demo updating
-    QTimer.singleShot(1000, lambda: overlay.update_status("Listening", "lightblue"))
-    QTimer.singleShot(2000, lambda: overlay.add_log_message("Jasper, what's the weather today?"))
-    QTimer.singleShot(3000, lambda: overlay.update_status("Processing", "yellow"))
-    QTimer.singleShot(4000, lambda: overlay.update_status("Responding", "lightgreen"))
+    QTimer.singleShot(
+        1000, lambda: overlay.update_status("Listening", "lightblue")
+    )
+    QTimer.singleShot(
+        2000,
+        lambda: overlay.add_log_message(
+            "Jasper, what's the weather today?"
+        ),
+    )
+    QTimer.singleShot(
+        3000, lambda: overlay.update_status("Processing", "yellow")
+    )
+    QTimer.singleShot(
+        4000, lambda: overlay.update_status("Responding", "lightgreen")
+    )
     QTimer.singleShot(
         4500,
-        lambda: overlay.add_log_message("It's currently sunny and 22°C outside with a light breeze."),
+        lambda: overlay.add_log_message(
+            "It's currently sunny and 22°C outside with a light breeze."
+        ),
     )
-    QTimer.singleShot(6000, lambda: overlay.update_status("Listening", "lightblue"))
+    QTimer.singleShot(
+        6000, lambda: overlay.update_status("Listening", "lightblue")
+    )
 
     sys.exit(app.exec_())
 
