@@ -69,6 +69,18 @@ class Config:
     MAX_WORKERS = 3
     AUDIO_PROCESSING_TIMEOUT = 10
 
+    # Command Execution Safety
+    COMMAND_TIMEOUT = int(os.environ.get("COMMAND_TIMEOUT", "30"))
+    COMMAND_MAX_OUTPUT_CHARS = int(
+        os.environ.get("COMMAND_MAX_OUTPUT_CHARS", "10000")
+    )
+    COMMAND_REQUIRE_CONFIRMATION = (
+        os.environ.get("COMMAND_REQUIRE_CONFIRMATION", "true")
+        .strip()
+        .lower()
+        in ("1", "true", "yes", "on")
+    )
+
     # Agent Configuration
     THREAD_ID = "4"
     MAX_TOKENS_HISTORY = 10000

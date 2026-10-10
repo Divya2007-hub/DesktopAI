@@ -1,4 +1,7 @@
 import functools
+import os
+import re
+import signal
 import subprocess
 from typing import Literal
 
@@ -23,6 +26,60 @@ _tools_registry = []
 adb = AdbClient(host=config.ADB_HOST, port=config.ADB_PORT)
 
 
+# Commands matching these patterns require explicit user approval.
+DANGEROUS_COMMAND_PATTERNS = (
+    r"\brm\b.*(?:-[a-zA-Z]*[rf]|--recursive|--force)",
+    r"\bmkfs(?:\.[a-zA-Z0-9_-]+)?\b",
+    r"\bdd\b.*\bif\s*=",
+    r"\bsudo\b",
+    r"\bshutdown\b",
+    r"\breboot\b",
+    r"\bpoweroff\b",
+    r"\bchmod\s+-R\b",
+    r"\bchown\s+-R\b",
+    r":\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}",
+)
+
+
+def is_dangerous_command(command: str) -> bool:
+    """Return True when a command matches a risky-command pattern."""
+    return any(
+        re.search(pattern, command, re.IGNORECASE)
+        for pattern in DANGEROUS_COMMAND_PATTERNS
+    )
+
+
+def truncate_command_output(output: str) -> str:
+    """Limit returned output and clearly indicate when it was truncated."""
+    limit = max(1, config.COMMAND_MAX_OUTPUT_CHARS)
+
+    if len(output) <= limit:
+        return output
+
+    marker = "...[truncated]"
+
+    if limit <= len(marker):
+        return marker[:limit]
+
+    return output[: limit - len(marker)] + marker
+
+
+def terminate_command_process(process):
+    """Terminate the command process, including its process group on POSIX."""
+    try:
+        if os.name == "posix":
+            os.killpg(process.pid, signal.SIGKILL)
+        else:
+            process.kill()
+    except ProcessLookupError:
+        pass
+    except OSError:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
 def register_stop_assistant(callback):
     global _stop_assistant
     _stop_assistant = callback
@@ -37,7 +94,9 @@ def tool(_func=None, *, return_direct=False):
         @_tool(return_direct=return_direct)
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            logger.info(f"[{func.__name__}] Called with args: {args}, kwargs: {kwargs}")
+            logger.info(
+                f"[{func.__name__}] Called with args: {args}, kwargs: {kwargs}"
+            )
             try:
                 result = func(*args, **kwargs)
                 logger.debug(f"[{func.__name__}] Result: {result}")
@@ -61,12 +120,17 @@ def adb_required(func):
     @functools.wraps(func)
     def wrapper(*args, **kwargs):
         try:
-            adb.connect(f"{config.MOBILE_HOST}:{config.MOBILE_PORT}", timeout=5)
+            adb.connect(
+                f"{config.MOBILE_HOST}:{config.MOBILE_PORT}",
+                timeout=5,
+            )
         except AdbTimeout:
             return "Couldn't connect to mobile."
+
         devices = adb.list()
         if devices and devices[0].state == "device":
             return func(*args, **kwargs)
+
         return "Couldn't connect to mobile."
 
     return wrapper
@@ -74,8 +138,65 @@ def adb_required(func):
 
 @tool
 def run_command(command: str) -> str:
-    """Run a shell command on the local Linux machine."""
-    return subprocess.check_output(command, shell=True, stderr=subprocess.STDOUT, text=True)
+    """Run a shell command with safety checks, timeout, and output limits."""
+    if not command or not command.strip():
+        return "Error: command cannot be empty."
+
+    if config.COMMAND_REQUIRE_CONFIRMATION and is_dangerous_command(command):
+        logger.warning("Command requires confirmation: %s", command)
+
+        try:
+            approved = overlay.confirm_command(command)
+        except Exception:
+            logger.exception("Command confirmation failed.")
+            return "Command cancelled: confirmation could not be obtained."
+
+        if not approved:
+            return "Command cancelled: user approval was not received."
+
+    process = None
+
+    try:
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            start_new_session=(os.name == "posix"),
+        )
+
+        try:
+            output, _ = process.communicate(
+                timeout=config.COMMAND_TIMEOUT
+            )
+        except subprocess.TimeoutExpired:
+            terminate_command_process(process)
+            output, _ = process.communicate()
+            output = truncate_command_output(output or "")
+
+            message = (
+                f"Error: command timed out after "
+                f"{config.COMMAND_TIMEOUT} seconds."
+            )
+            if output:
+                message += f"\n{output}"
+
+            return message
+
+        output = truncate_command_output(output or "")
+
+        if process.returncode != 0:
+            return (
+                f"Error: command exited with status "
+                f"{process.returncode}.\n{output}"
+            )
+
+        return output or "Command completed successfully."
+
+    except OSError as exc:
+        logger.exception("Failed to execute command.")
+        return f"Error: failed to execute command: {exc}"
 
 
 @tool
@@ -83,7 +204,11 @@ def open_google_chrome(url: str | None, new_window: bool = False) -> str:
     """
     Open Google Chrome with the specified URL (if url is provided).
     """
-    command = f"google-chrome-stable {'--new-window' if new_window else ''} {url if url else ''}"
+    command = (
+        f"google-chrome-stable "
+        f"{'--new-window' if new_window else ''} "
+        f"{url if url else ''}"
+    )
     logger.info(f"[open_google_chrome] Command: {command}")
 
     try:
@@ -97,11 +222,16 @@ def open_google_chrome(url: str | None, new_window: bool = False) -> str:
 @tool
 def open_whatsapp_web() -> str:
     """
-    Open WhatsApp Web
+    Open WhatsApp Web.
     """
     logger.info("[open_whatsapp_web] Opening WhatsApp Web...")
     try:
-        subprocess.Popen(["gtk-launch", "chrome-hnpfjngllnobngcgfapefoaidbinmjnm-Default.desktop"])
+        subprocess.Popen(
+            [
+                "gtk-launch",
+                "chrome-hnpfjngllnobngcgfapefoaidbinmjnm-Default.desktop",
+            ]
+        )
         return "WhatsApp Web launched."
     except Exception as e:
         logger.error(f"[open_whatsapp_web] Error: {e}")
@@ -111,7 +241,7 @@ def open_whatsapp_web() -> str:
 @tool
 def show_popup_widget() -> str:
     """
-    Show the popup widget
+    Show the popup widget.
     """
     overlay.show()
     return "Popup widget opened."
@@ -120,7 +250,7 @@ def show_popup_widget() -> str:
 @tool
 def hide_popup_widget() -> str:
     """
-    Hide the popup widget
+    Hide the popup widget.
     """
     overlay.hide()
     return "Popup widget closed."
@@ -129,7 +259,7 @@ def hide_popup_widget() -> str:
 @tool
 def do_nothing() -> None:
     """
-    A function that does nothing
+    A function that does nothing.
     """
     logger.info("[do_nothing] Called.")
 
@@ -137,7 +267,7 @@ def do_nothing() -> None:
 @tool(return_direct=True)
 def get_screenshot() -> str:
     """
-    Get a screenshot of the current screen
+    Get a screenshot of the current screen.
     """
     logger.info("[get_screenshot] Taking screenshot...")
     screenshot = ImageGrab.grab()
@@ -149,16 +279,17 @@ def get_screenshot() -> str:
 @tool(return_direct=True)
 def exit_assistant() -> str:
     """
-    Exit / Stop / Shutdown
+    Exit / Stop / Shutdown.
     """
     if _stop_assistant:
-        # Schedule the shutdown to happen after the response is returned
+        # Schedule shutdown after the response is returned.
         import threading
 
         threading.Timer(0.1, _stop_assistant).start()
     else:
         logger.warning("[exit] No stop callback registered.")
         return "No stop callback registered."
+
     return "Assistant stopped."
 
 
@@ -176,6 +307,7 @@ def web_search(
         max_results=max_results,
         search_depth=search_depth,
     )
+
     try:
         results = search_tool.invoke({"query": query})
         return str(results)
@@ -196,11 +328,20 @@ def mirror_mobile(
     if source == "screen":
         subprocess.Popen("scrcpy", shell=True)
         return "Starting mobile screen mirroring using scrcpy."
+
     if source == "camera":
         if not camera_facing or camera_facing not in ["front", "back"]:
             camera_facing = "back"
-        subprocess.Popen(["scrcpy", "--video-source=camera", f"--camera-facing={camera_facing}"])
+
+        subprocess.Popen(
+            [
+                "scrcpy",
+                "--video-source=camera",
+                f"--camera-facing={camera_facing}",
+            ]
+        )
         return f"Starting mobile camera {camera_facing} mirroring using scrcpy."
+
     return "Invalid source. Use 'screen' or 'camera'."
 
 
@@ -211,7 +352,10 @@ def get_location() -> str:
     Get the current location from the connected mobile device using ADB.
     """
     device = adb.device()
-    return device.shell(r"dumpsys location | grep 'Location\[' | head -n 1 | grep -oE '[0-9]+\.[0-9]+,[0-9]+\.[0-9]+'")
+    return device.shell(
+        r"dumpsys location | grep 'Location\[' | head -n 1 "
+        r"| grep -oE '[0-9]+\.[0-9]+,[0-9]+\.[0-9]+'"
+    )
 
 
 def get_all_tools() -> list[StructuredTool]:
